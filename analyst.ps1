@@ -142,7 +142,7 @@ Show-Banner
 
 $admin = Is-Admin
 if (-not $admin) {
-    Write-Host "$PinkWARNING:$Reset Not running as Administrator. Some checks may be limited." -ForegroundColor Yellow
+    Write-Host "${Pink}WARNING:${Reset} Not running as Administrator. Some checks may be limited." -ForegroundColor Yellow
     Write-Host ""
 }
 
@@ -217,8 +217,10 @@ $steps = @(
 
         $suspended = @()
         foreach ($p in $procs.ProcessId) {
-            $threads = Get-Process -Id $p -Module -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Threads | Where-Object { $_.ThreadState -eq "Suspended" }
-            if ($threads) { $suspended += [pscustomobject]@{PID=$p; SuspendedThreads=$threads.Count} }
+            try {
+                $threads = (Get-Process -Id $p -ErrorAction SilentlyContinue).Threads | Where-Object { $_.ThreadState -eq "Suspended" }
+                if ($threads) { $suspended += [pscustomobject]@{PID=$p; SuspendedThreads=$threads.Count} }
+            } catch {}
         }
         Export-CsvSafe (Join-Path $F.Process "suspended_threads.csv") $suspended
         if ($suspended.Count -gt 0) { Add-Finding "HIGH" "Process" "Suspended Threads Detected" "Review." "02_Process\suspended_threads.csv" }
@@ -226,8 +228,8 @@ $steps = @(
         $hollowHits = @()
         foreach ($p in $procs) {
             if ($p.ExecutablePath -and (Test-Path $p.ExecutablePath)) {
-                $fileMod = (Get-Item $p.ExecutablePath).LastWriteTime
-                if ($p.CreationDate -lt $fileMod.AddMinutes(-5)) { $hollowHits += $p }
+                $fileMod = (Get-Item $p.ExecutablePath -ErrorAction SilentlyContinue).LastWriteTime
+                if ($fileMod -and $p.CreationDate -lt $fileMod.AddMinutes(-5)) { $hollowHits += $p }
             }
         }
         Export-CsvSafe (Join-Path $F.Findings "potential_hollowing.csv") $hollowHits
@@ -272,39 +274,43 @@ $steps = @(
         Export-CsvSafe (Join-Path $F.Process "module_targets.csv") $targets
 
         foreach ($t in $targets) {
-            $gp = Get-Process -Id $t.ProcessId -Module -ErrorAction SilentlyContinue
-            if ($gp) {
-                $mods = $gp.Modules | Select-Object ModuleName, FileName, BaseAddress, ModuleMemorySize
-                $fn = "modules_pid$($t.ProcessId)_$($t.Name).csv"
-                Export-CsvSafe (Join-Path $F.Process $fn) $mods
+            try {
+                $gp = Get-Process -Id $t.ProcessId -Module -ErrorAction SilentlyContinue
+                if ($gp) {
+                    $mods = $gp.Modules | Select-Object ModuleName, FileName, BaseAddress, ModuleMemorySize
+                    $fn = "modules_pid$($t.ProcessId)_$($t.Name -replace '[^A-Za-z0-9]','_').csv"
+                    Export-CsvSafe (Join-Path $F.Process $fn) $mods
 
-                $badMods = $mods | Where-Object { $_.FileName -match "\\Users\\|\\AppData\\|\\Temp\\|\\ProgramData\\" }
-                if ($badMods.Count -gt 0) { Add-Finding "HIGH" "Modules" "Modules from Writable Paths" "Review $fn" "02_Process\$fn" }
+                    $badMods = $mods | Where-Object { $_.FileName -match "\\Users\\|\\AppData\\|\\Temp\\|\\ProgramData\\" }
+                    if ($badMods.Count -gt 0) { Add-Finding "HIGH" "Modules" "Modules from Writable Paths" "Review $fn" "02_Process\$fn" }
 
-                $proxyHits = $mods | Where-Object { $_.ModuleName -match $Regex_Suspicious }
-                if ($proxyHits.Count -gt 0) { Add-Finding "HIGH" "Modules" "Suspicious Module Names" "Review $fn" "02_Process\$fn" }
-            }
+                    $proxyHits = $mods | Where-Object { $_.ModuleName -match $Regex_Suspicious }
+                    if ($proxyHits.Count -gt 0) { Add-Finding "HIGH" "Modules" "Suspicious Module Names" "Review $fn" "02_Process\$fn" }
+                }
+            } catch {}
         }
     }},
     @{ pct = 40; msg = "Network Snapshot..."; action = {
-        Get-NetTCPConnection | Export-CsvSafe (Join-Path $F.Network "net_tcp.csv")
-        ipconfig /displaydns > (Join-Path $F.Network "dns_cache.txt")
-        $dnsContent = Get-Content (Join-Path $F.Network "dns_cache.txt")
-        if ($dnsContent -match "cheat|hack|proxy") { Add-Finding "MED" "Network" "Suspicious DNS Entries" "Review." "03_Network\dns_cache.txt" }
+        try { Get-NetTCPConnection | Export-CsvSafe (Join-Path $F.Network "net_tcp.csv") } catch {}
+        cmd /c "ipconfig /displaydns" > (Join-Path $F.Network "dns_cache.txt") 2>$null
+        $dnsContent = Get-Content (Join-Path $F.Network "dns_cache.txt") -ErrorAction SilentlyContinue
+        if ($dnsContent -match "(?i)cheat|hack|proxy") { Add-Finding "MED" "Network" "Suspicious DNS Entries" "Review." "03_Network\dns_cache.txt" }
     }},
     @{ pct = 45; msg = "Services & Drivers..."; action = {
         Get-Service | Export-CsvSafe (Join-Path $F.System "services.csv")
         $suspendedSvcs = Get-Service | Where-Object { $_.Status -eq "Paused" }
         Export-CsvSafe (Join-Path $F.System "suspended_services.csv") $suspendedSvcs
         if ($suspendedSvcs.Count -gt 0) { Add-Finding "MED" "Services" "Paused Services Detected" "Review." "01_System\suspended_services.csv" }
-        driverquery /si > (Join-Path $F.System "drivers_signed.txt")
+        cmd /c "driverquery /si" > (Join-Path $F.System "drivers_signed.txt") 2>$null
     }},
     @{ pct = 55; msg = "Persistence Sweep..."; action = {
-        schtasks /query /fo CSV /v > (Join-Path $F.Persistence "tasks.csv")
+        cmd /c "schtasks /query /fo CSV /v" > (Join-Path $F.Persistence "tasks.csv") 2>$null
 
         $startupPaths = @("$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup", "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup")
         foreach ($sp in $startupPaths) {
-            Get-ChildItem $sp -Force | Export-CsvSafe (Join-Path $F.Persistence ("startup_" + (Split-Path $sp -Leaf) + ".csv"))
+            if (Test-Path $sp) {
+                Get-ChildItem $sp -Force -ErrorAction SilentlyContinue | Export-CsvSafe (Join-Path $F.Persistence ("startup_" + (Split-Path $sp -Leaf) + ".csv"))
+            }
         }
 
         $regKeys = @(
@@ -318,38 +324,43 @@ $steps = @(
             "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SilentProcessExit"
         )
         $regDir = Join-Path $F.Persistence "registry"
-        New-Item -ItemType Directory $regDir | Out-Null
+        New-Item -ItemType Directory $regDir -Force | Out-Null
         foreach ($key in $regKeys) {
             $safeName = $key -replace "[:\\]", "_"
-            reg export $key (Join-Path $regDir "$safeName.reg") /y 2>$null
+            cmd /c "reg export `"$key`" `"$(Join-Path $regDir "$safeName.reg")`" /y" 2>$null
         }
 
-        $xmlTasks = Get-ChildItem "C:\Windows\System32\Tasks" -Filter *.xml -Recurse -ErrorAction SilentlyContinue
-        foreach ($xml in $xmlTasks) {
-            Copy-Item $xml.FullName (Join-Path $F.Persistence "startup_xml") -Force
+        $xmlDir = Join-Path $F.Persistence "startup_xml"
+        New-Item -ItemType Directory $xmlDir -Force | Out-Null
+        Get-ChildItem "C:\Windows\System32\Tasks" -Filter *.xml -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item $_.FullName $xmlDir -Force
         }
-        if ($xmlTasks.Count -gt 0) { Add-Finding "MED" "Persistence" "Startup XML Tasks Found" "Review." "04_Persistence\startup_xml" }
+        if ((Get-ChildItem $xmlDir).Count -gt 0) { Add-Finding "MED" "Persistence" "Startup XML Tasks Found" "Review." "04_Persistence\startup_xml" }
 
-        $wmiFilters = Get-CimInstance -Namespace root\subscription -Class __EventFilter
-        $wmiConsumers = Get-CimInstance -Namespace root\subscription -Class __EventConsumer
-        $wmiBindings = Get-CimInstance -Namespace root\subscription -Class __FilterToConsumerBinding
-        Export-CsvSafe (Join-Path $F.Persistence "wmi_filters.csv") $wmiFilters
-        Export-CsvSafe (Join-Path $F.Persistence "wmi_consumers.csv") $wmiConsumers
-        Export-CsvSafe (Join-Path $F.Persistence "wmi_bindings.csv") $wmiBindings
-        if ($wmiFilters.Count + $wmiConsumers.Count + $wmiBindings.Count -gt 0) {
-            Add-Finding "HIGH" "Persistence" "WMI Persistence Artifacts" "Review." "04_Persistence"
-        }
+        try {
+            $wmiFilters = Get-CimInstance -Namespace root\subscription -Class __EventFilter -ErrorAction SilentlyContinue
+            $wmiConsumers = Get-CimInstance -Namespace root\subscription -Class __EventConsumer -ErrorAction SilentlyContinue
+            $wmiBindings = Get-CimInstance -Namespace root\subscription -Class __FilterToConsumerBinding -ErrorAction SilentlyContinue
+            Export-CsvSafe (Join-Path $F.Persistence "wmi_filters.csv") $wmiFilters
+            Export-CsvSafe (Join-Path $F.Persistence "wmi_consumers.csv") $wmiConsumers
+            Export-CsvSafe (Join-Path $F.Persistence "wmi_bindings.csv") $wmiBindings
+            if (($wmiFilters.Count + $wmiConsumers.Count + $wmiBindings.Count) -gt 0) {
+                Add-Finding "HIGH" "Persistence" "WMI Persistence Artifacts" "Review." "04_Persistence"
+            }
+        } catch {}
     }},
     @{ pct = 60; msg = "PowerShell Artifacts..."; action = {
-        $psProfiles = @($PROFILE.AllUsersAllHosts, $PROFILE.AllUsersCurrentHost, $PROFILE.CurrentUserAllHosts, $PROFILE.CurrentUserCurrentHost)
-        foreach ($prof in $psProfiles) {
-            if (Test-Path $prof) { Copy-Item $prof (Join-Path $F.Persistence "ps_profiles") -Force }
-        }
+        $psDir = Join-Path $F.Persistence "ps_profiles"
+        New-Item -ItemType Directory $psDir -Force | Out-Null
+        @($PROFILE.AllUsersAllHosts, $PROFILE.AllUsersCurrentHost, $PROFILE.CurrentUserAllHosts, $PROFILE.CurrentUserCurrentHost) |
+            Where-Object { $_ -and (Test-Path $_) } | ForEach-Object {
+                Copy-Item $_ $psDir -Force
+            }
 
         $psReadLine = Join-Path $env:APPDATA "Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
-        if (Test-Path $psReadLine) { Copy-Item $psReadLine (Join-Path $F.Persistence "psreadline_history.txt") }
+        if (Test-Path $psReadLine) { Copy-Item $psReadLine (Join-Path $F.Persistence "psreadline_history.txt") -Force }
 
-        Get-Process | Where-Object { $_.Name -match "java|minecraft" } | Export-CsvSafe (Join-Path $F.Minecraft "miniss_java_processes.csv")
+        Get-Process | Where-Object { $_.Name -match "(?i)java|minecraft" } | Export-CsvSafe (Join-Path $F.Minecraft "miniss_java_processes.csv")
     }},
     @{ pct = 70; msg = "File System Forensics..."; action = {
         $reparse = @()
@@ -363,9 +374,11 @@ $steps = @(
         $adsHits = @()
         foreach ($r in $roots) {
             Get-ChildItemDepth $r -Depth 4 | ForEach-Object {
-                Get-Item $_.FullName -Stream * | Where-Object { $_.Stream -ne ':$DATA' } | ForEach-Object {
-                    $adsHits += [pscustomobject]@{Path=$_.FileName; Stream=$_.Stream; Length=$_.Length}
-                }
+                try {
+                    Get-Item $_.FullName -Stream * -ErrorAction SilentlyContinue | Where-Object { $_.Stream -ne ':$DATA' } | ForEach-Object {
+                        $adsHits += [pscustomobject]@{Path=$_.FileName; Stream=$_.Stream; Length=$_.Length}
+                    }
+                } catch {}
             }
         }
         Export-CsvSafe (Join-Path $F.FileSystem "ads_streams.csv") $adsHits
@@ -394,23 +407,25 @@ $steps = @(
         Export-CsvSafe (Join-Path $F.FileSystem "bak_files.csv") $bakFiles
         if ($bakFiles.Count -gt 0) { Add-Finding "LOW" "FileSystem" ".bak-like Files in Minecraft" "Review." "06_FileSystem\bak_files.csv" }
 
-        Get-ChildItem "C:\" -Recurse -Depth 2 -ErrorAction SilentlyContinue | Sort LastWriteTime -Descending | Select -First 100 | Export-CsvSafe (Join-Path $F.Forensics "recent_mft_proxy.csv")
+        Get-ChildItem "C:\" -Recurse -Depth 2 -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 100 | Export-CsvSafe (Join-Path $F.Forensics "recent_mft_proxy.csv")
     }},
     @{ pct = 80; msg = "Minecraft-Specific Analysis..."; action = {
         if (Test-Path $mcRoot) {
             $modFolder = Join-Path $mcRoot "mods"
             if (Test-Path $modFolder) {
-                $mods = Get-ChildItem $modFolder -Filter *.jar
+                $mods = Get-ChildItem $modFolder -Filter *.jar -ErrorAction SilentlyContinue
                 $recentMods = $mods | Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-30) }
                 Export-CsvSafe (Join-Path $F.Minecraft "mods_list.csv") $mods
                 if ($recentMods.Count -gt 0) { Add-Finding "HIGH" "Minecraft" "Recent Mod Folder Changes" "Review." "07_Minecraft\mods_list.csv" }
             }
 
-            $jars = Get-ChildItem $mcRoot -Recurse -Filter *.jar
+            $jars = Get-ChildItem $mcRoot -Recurse -Filter *.jar -ErrorAction SilentlyContinue
             $jarHashes = @()
             foreach ($jar in $jars) {
-                $hash = Get-FileHash $jar.FullName -Algorithm SHA256
-                $jarHashes += [pscustomobject]@{Path=$jar.FullName; SHA256=$hash.Hash; LastWrite=$jar.LastWriteTime}
+                try {
+                    $hash = Get-FileHash $jar.FullName -Algorithm SHA256 -ErrorAction SilentlyContinue
+                    $jarHashes += [pscustomobject]@{Path=$jar.FullName; SHA256=$hash.Hash; LastWrite=$jar.LastWriteTime}
+                } catch {}
             }
             Export-CsvSafe (Join-Path $F.Minecraft "all_jars_hashes.csv") $jarHashes
 
@@ -420,7 +435,10 @@ $steps = @(
 
             $forgeLogs = Join-Path $mcRoot "logs"
             if (Test-Path $forgeLogs) {
-                Get-ChildItem $forgeLogs | Sort LastWriteTime -Descending | Select -First 10 | Copy-Item -Destination (Join-Path $F.Minecraft "forge_logs_recent") -Force
+                New-Item -ItemType Directory (Join-Path $F.Minecraft "forge_logs_recent") -Force | Out-Null
+                Get-ChildItem $forgeLogs -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 10 | ForEach-Object {
+                    Copy-Item $_.FullName (Join-Path $F.Minecraft "forge_logs_recent") -Force
+                }
             }
         } else {
             Add-Finding "LOW" "Minecraft" ".minecraft Not Found" "Review." "07_Minecraft"
@@ -429,60 +447,79 @@ $steps = @(
     @{ pct = 85; msg = "Event Logs & Anti-Forensic Checks..."; action = {
         $logNames = @("System", "Application", "Security", "Microsoft-Windows-PowerShell/Operational")
         foreach ($ln in $logNames) {
-            wevtutil epl $ln (Join-Path $F.Logs "$ln.evtx") 2>$null
+            cmd /c "wevtutil epl `"$ln`" `"$(Join-Path $F.Logs "$ln.evtx")`"" 2>$null
         }
 
-        $clearEvents = Get-WinEvent -FilterHashtable @{LogName="Security"; Id=1102} -MaxEvents 10 -ErrorAction SilentlyContinue
-        Export-CsvSafe (Join-Path $F.Logs "log_clear_events.csv") $clearEvents
-        if ($clearEvents.Count -gt 0) { Add-Finding "HIGH" "Logs" "Event Log Clears Detected" "Review." "05_Logs\log_clear_events.csv" }
+        try {
+            $clearEvents = Get-WinEvent -FilterHashtable @{LogName="Security"; ID=1102} -MaxEvents 10 -ErrorAction SilentlyContinue
+            Export-CsvSafe (Join-Path $F.Logs "log_clear_events.csv") $clearEvents
+            if ($clearEvents.Count -gt 0) { Add-Finding "HIGH" "Logs" "Event Log Clears Detected" "Review." "05_Logs\log_clear_events.csv" }
+        } catch {}
 
-        $sherlockHits = Get-WinEvent -FilterHashtable @{LogName="Application"; ProviderName="Microsoft-Windows-Sysmon"; Id=1,3,5} -MaxEvents 50 -ErrorAction SilentlyContinue | Where-Object { $_.Message -match "cheat|inject|hook" }
-        Export-CsvSafe (Join-Path $F.Findings "sherlock_suspicious_events.csv") $sherlockHits
+        try {
+            $sherlockHits = Get-WinEvent -FilterHashtable @{LogName="Application"; ProviderName="Microsoft-Windows-Sysmon"; ID=1,3,5} -MaxEvents 50 -ErrorAction SilentlyContinue |
+                Where-Object { $_.Message -match "(?i)cheat|inject|hook" }
+            Export-CsvSafe (Join-Path $F.Findings "sherlock_suspicious_events.csv") $sherlockHits
+        } catch {}
     }},
     @{ pct = 90; msg = "Advanced Forensics..."; action = {
-        vssadmin list shadows > (Join-Path $F.Forensics "vss_list.txt")
-        $vssCount = (Get-Content (Join-Path $F.Forensics "vss_list.txt") | Select-String "Shadow Copy ID").Count
-        if ($vssCount -eq 0) { Add-Finding "MED" "Forensics" "No Volume Shadow Copies" "Review." "08_Forensics\vss_list.txt" }
+        cmd /c "vssadmin list shadows" > (Join-Path $F.Forensics "vss_list.txt") 2>$null
+        $vssContent = Get-Content (Join-Path $F.Forensics "vss_list.txt") -ErrorAction SilentlyContinue
+        if ($vssContent -notmatch "Shadow Copy ID") { Add-Finding "MED" "Forensics" "No Volume Shadow Copies" "Review." "08_Forensics\vss_list.txt" }
 
-        Get-Process "lsass" | Export-CsvSafe (Join-Path $F.Forensics "kernel_dump_proxy_lsass.csv")
+        Get-Process "lsass" -ErrorAction SilentlyContinue | Export-CsvSafe (Join-Path $F.Forensics "kernel_dump_proxy_lsass.csv")
 
         Get-ChildItem "C:\$Recycle.Bin" -Recurse -Force -ErrorAction SilentlyContinue | Export-CsvSafe (Join-Path $F.Forensics "deleted_files_recycle.csv")
     }},
     @{ pct = 95; msg = "Suspicious Pattern Search..."; action = {
-        $doomsDayHits = Get-ChildItem $roots -Recurse -Filter "*.(exe|dll|jar)" -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $Regex_Suspicious }
+        $doomsDayHits = @()
+        foreach ($r in $roots) {
+            Get-ChildItem $r -Recurse -Filter "*.(exe|dll|jar)" -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $Regex_Suspicious } | ForEach-Object {
+                $doomsDayHits += $_
+            }
+        }
         Export-CsvSafe (Join-Path $F.Minecraft "doomsday_cheat_hits.csv") $doomsDayHits
 
         $oceanHits = $jarHashes | Where-Object { (Get-FileEntropy $_.Path) -gt 7.5 }
         Export-CsvSafe (Join-Path $F.Minecraft "ocean_high_entropy_jars.csv") $oceanHits
 
-        Get-ChildItem $mcRoot -Recurse | Export-CsvSafe (Join-Path $F.Minecraft "global_lister_minecraft.csv")
+        Get-ChildItem $mcRoot -Recurse -ErrorAction SilentlyContinue | Export-CsvSafe (Join-Path $F.Minecraft "global_lister_minecraft.csv")
     }},
     @{ pct = 100; msg = "Finalizing findings & zipping..."; action = {
-        $FindingsSorted = $Findings | Sort-Object SeverityRank -Descending, Category, Title
+        $FindingsSorted = $Findings | Sort-Object @{Expression='SeverityRank'; Descending=$true}, @{Expression='Category'; Descending=$false}, @{Expression='Title'; Descending=$false}
         Export-CsvSafe (Join-Path $F.Findings "findings.csv") $FindingsSorted
 
         $readme = Join-Path $F.Findings "findings_readme.txt"
-        @("FINDINGS", "Generated: $(Get-Date -Format o)", "") + 
-          ($FindingsSorted | ForEach-Object { "[$($_.Severity)] $($_.Category) - $($_.Title)`nDetail: $($_.Detail)`nEvidence: $($_.Evidence)`n" }) |
-          Out-File $readme -Encoding utf8
+        $txtContent = @("FINDINGS", "Generated: $(Get-Date -Format o)", "")
+        foreach ($f in $FindingsSorted) {
+            $txtContent += "[$($f.Severity)] $($f.Category) - $($f.Title)"
+            $txtContent += "Detail: $($f.Detail)"
+            $txtContent += "Evidence: $($f.Evidence)"
+            $txtContent += ""
+        }
+        $txtContent | Out-File $readme -Encoding utf8
 
         $summaryPath = Join-Path $out "summary.txt"
+        $summary.Add("Findings: " + $Findings.Count)
+        $summary.Add("High: " + ($Findings | Where-Object { $_.Severity -eq "HIGH" }).Count)
+        $summary.Add("Med: " + ($Findings | Where-Object { $_.Severity -eq "MED" }).Count)
+        $summary.Add("Low: " + ($Findings | Where-Object { $_.Severity -eq "LOW" }).Count)
         $summary | Out-File $summaryPath -Encoding utf8
 
-        Compress-Archive -Path $out -DestinationPath "$out.zip" -Force
+        Compress-Archive -Path $out -DestinationPath "$out.zip" -Force -ErrorAction SilentlyContinue
     }}
 )
 
 foreach ($step in $steps) {
     Show-ProgressBar $step.pct $step.msg
-    try { & $step.action } catch {}
+    try { & $step.action } catch { Write-Host "$Pink[ERROR]$Reset Step failed: $($step.msg)" }
     Start-Sleep -Milliseconds 150
 }
 
 [Console]::WriteLine("")
 Write-Host "$PinkDONE$Reset" -ForegroundColor Green
-Write-Host "Folder → $out"
-Write-Host "ZIP    → $out.zip"
+Write-Host "Output Folder → $out"
+Write-Host "Zipped Results → $out.zip"
 Write-Host ""
 
 try { Stop-Transcript | Out-Null } catch {}
